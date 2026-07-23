@@ -24,63 +24,82 @@
 #include "../tiny_sulog.c"
 
 struct ksu_install_fd_tw {
-    struct callback_head cb;
-    int __user *outp;
+	struct callback_head cb;
+	int __user *outp;
 };
 
 static int anon_ksu_release(struct inode *inode, struct file *filp)
 {
-    pr_info("ksu fd released\n");
-    return 0;
+	pr_info("ksu fd released\n");
+	return 0;
 }
 
 static long anon_ksu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-    return ksu_supercall_handle_ioctl(cmd, (void __user *)arg);
+	return ksu_supercall_handle_ioctl(cmd, (void __user *)arg);
 }
 
 static const struct file_operations anon_ksu_fops = {
-    .owner = THIS_MODULE,
-    .unlocked_ioctl = anon_ksu_ioctl,
-    .compat_ioctl = anon_ksu_ioctl,
-    .release = anon_ksu_release,
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = anon_ksu_ioctl,
+	.compat_ioctl = anon_ksu_ioctl,
+	.release = anon_ksu_release,
 };
 
 int ksu_install_fd(void)
 {
-    struct file *filp;
-    int fd;
+	struct file *filp;
+	int fd;
 
-    fd = get_unused_fd_flags(O_CLOEXEC);
-    if (fd < 0) {
-        pr_err("ksu_install_fd: failed to get unused fd\n");
-        return fd;
-    }
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) {
+		pr_err("ksu_install_fd: failed to get unused fd\n");
+		return fd;
+	}
 
-    filp = anon_inode_getfile("[ksu_driver]", &anon_ksu_fops, NULL, O_RDWR | O_CLOEXEC);
-    if (IS_ERR(filp)) {
-        pr_err("ksu_install_fd: failed to create anon inode file\n");
-        put_unused_fd(fd);
-        return PTR_ERR(filp);
-    }
+	filp = anon_inode_getfile("[ksu_driver]", &anon_ksu_fops, NULL, O_RDWR | O_CLOEXEC);
+	if (IS_ERR(filp)) {
+		pr_err("ksu_install_fd: failed to create anon inode file\n");
+		put_unused_fd(fd);
+		return PTR_ERR(filp);
+	}
 
-    fd_install(fd, filp);
-    pr_info("ksu fd installed: %d for pid %d\n", fd, current->pid);
-    return fd;
+	fd_install(fd, filp);
+	pr_info("ksu fd installed: %d for pid %d\n", fd, current->pid);
+	return fd;
 }
 
 static void ksu_install_fd_tw_func(struct callback_head *cb)
 {
-    struct ksu_install_fd_tw *tw = container_of(cb, struct ksu_install_fd_tw, cb);
-    int fd = ksu_install_fd();
+	struct ksu_install_fd_tw *tw = container_of(cb, struct ksu_install_fd_tw, cb);
+	int fd = ksu_install_fd();
 
-    pr_info("[%d] install ksu fd: %d\n", current->pid, fd);
-    if (copy_to_user(tw->outp, &fd, sizeof(fd))) {
-        pr_err("install ksu fd reply err\n");
-        ksu_close_fd(fd);
-    }
+	pr_info("[%d] install ksu fd: %d\n", current->pid, fd);
+	if (copy_to_user(tw->outp, &fd, sizeof(fd))) {
+		pr_err("install ksu fd reply err\n");
+		ksu_close_fd(fd);
+	}
 
-    kfree(tw);
+	kfree(tw);
+}
+
+int ksu_supercall_reboot_handler(void __user **arg)
+{
+	struct ksu_install_fd_tw *tw;
+
+	tw = kzalloc(sizeof(*tw), GFP_KERNEL);
+	if (!tw)
+		return 0;
+
+	tw->outp = (int __user *)(*arg);
+	tw->cb.func = ksu_install_fd_tw_func;
+
+	if (task_work_add(current, &tw->cb, TWA_RESUME)) {
+		kfree(tw);
+		pr_warn("install fd add task_work failed\n");
+	}
+
+	return 0;
 }
 
 extern uint32_t ksuver_override;
@@ -90,210 +109,192 @@ extern uint32_t ksuflags_override;
 static int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)
 {
 
-    if (magic1 != KSU_INSTALL_MAGIC1)
-    	return 0;
+	if (magic1 != KSU_INSTALL_MAGIC1)
+		return 0;
 
-    pr_info("sys_reboot: intercepted call! magic: 0x%x id: %d\n", magic1, magic2);
+	pr_info("sys_reboot: intercepted call! magic: 0x%x id: %d\n", magic1, magic2);
 
-    // arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(real_regs);
-    // downstream: dereference arg as arg4 so we can be inline to upstream
-    void __user *arg4 = (void __user *)*arg;
+	// Check if this is a request to install KSU fd
+	if (magic2 == KSU_INSTALL_MAGIC2) {
+		return ksu_supercall_reboot_handler(arg);
+	}
 
-    // Check if this is a request to install KSU fd
-    if (magic2 == KSU_INSTALL_MAGIC2) {
-        struct ksu_install_fd_tw *tw;
+	// extensions
+	u64 reply = (u64)*arg;
 
-        tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
-        if (!tw)
-            return 0;
+	if (magic2 == CHANGE_MANAGER_UID) {
+		// only root is allowed for this command
+		if (current_uid().val != 0)
+			return 0;
 
-        tw->outp = (int __user *)arg4;
-        tw->cb.func = ksu_install_fd_tw_func;
+		pr_info("sys_reboot: ksu_set_manager_appid to: %d\n", cmd);
+		ksu_set_manager_appid(cmd);
 
-        if (task_work_add(current, &tw->cb, TWA_RESUME)) {
-            kfree(tw);
-            pr_warn("install fd add task_work failed\n");
-        }
-    }
+		if (cmd == ksu_get_manager_appid()) {
+			if (copy_to_user((void __user *)*arg, &reply, sizeof(reply)))
+				pr_info("sys_reboot: reply fail\n");
+		}
 
-    // downstream: extensions go here!
+		return 0;
+	}
 
-    // extensions
-    u64 reply = (u64)*arg;
+	if (magic2 == GET_SULOG_DUMP_V2) {
+		// only root is allowed for this command
+		if (current_uid().val != 0)
+			return 0;
 
-    if (magic2 == CHANGE_MANAGER_UID) {
-        // only root is allowed for this command
-        if (current_uid().val != 0)
-            return 0;
+		int ret = send_sulog_dump(*arg);
+			if (ret)
+				return 0;
 
-        pr_info("sys_reboot: ksu_set_manager_appid to: %d\n", cmd);
-        ksu_set_manager_appid(cmd);
+		if (copy_to_user((void __user *)*arg, &reply, sizeof(reply) ))
+			return 0;
+	}
 
-        if (cmd == ksu_get_manager_appid()) {
-            if (copy_to_user((void __user *)*arg, &reply, sizeof(reply)))
-            	pr_info("sys_reboot: reply fail\n");
-        }
+	if (magic2 == CHANGE_KSUVER) {
+		// only root is allowed for this command
+		if (current_uid().val != 0)
+			return 0;
 
-        return 0;
-    }
+		pr_info("sys_reboot: ksu_change_ksuver to: %d\n", cmd);
+		ksuver_override = cmd;
 
-    if (magic2 == GET_SULOG_DUMP_V2) {
-        // only root is allowed for this command
-        if (current_uid().val != 0)
-            return 0;
+		if (copy_to_user((void __user *)*arg, &reply, sizeof(reply) ))
+			return 0;
+	}
 
-        int ret = send_sulog_dump(*arg);
-            if (ret)
-                return 0;
+	// WARNING!!! triple ptr zone! ***
+	if (magic2 == CHANGE_SPOOF_UNAME) {
+		// only root is allowed for this command
+		if (current_uid().val != 0)
+			return 0;
 
-        if (copy_to_user((void __user *)*arg, &reply, sizeof(reply) ))
-            return 0;
-    }
+		char release_buf[65];
+		char version_buf[65];
+		static char original_release_buf[65] = {0};
+		static char original_version_buf[65] = {0};
 
-    if (magic2 == CHANGE_KSUVER) {
-        // only root is allowed for this command
-        if (current_uid().val != 0)
-            return 0;
+		// basically void * void __user * void __user *arg
+		void ***ppptr = (uintptr_t)arg;
 
-        pr_info("sys_reboot: ksu_change_ksuver to: %d\n", cmd);
-        ksuver_override = cmd;
+		// user pointer storage
+		// init this as zero this still works on 32-on-64 LE
+		uint64_t u_pptr = 0;
+		uint64_t u_ptr = 0;
 
-        if (copy_to_user((void __user *)*arg, &reply, sizeof(reply) ))
-            return 0;
-    }
+		pr_info("sys_reboot: ppptr: 0x%lx \n", (uintptr_t)ppptr);
 
-    // WARNING!!! triple ptr zone! ***
-    if (magic2 == CHANGE_SPOOF_UNAME) {
-        // only root is allowed for this command 
-        if (current_uid().val != 0)
-            return 0;
+		// arg here is ***, dereference to pull out **
+		if (copy_from_user(&u_pptr, (void __user *)*ppptr, sizeof(u_pptr)))
+			return 0;
 
-        char release_buf[65];
-        char version_buf[65];
-        static char original_release_buf[65] = {0};
-        static char original_version_buf[65] = {0};
+		pr_info("sys_reboot: u_pptr: 0x%lx \n", (uintptr_t)u_pptr);
 
-        // basically void * void __user * void __user *arg
-        void ***ppptr = (uintptr_t)arg;
+		// now we got the __user **
+		// we cannot dereference this as this is __user
+		// we just do another copy_from_user to get it
+		if (copy_from_user(&u_ptr, (void __user *)u_pptr, sizeof(u_ptr)))
+			return 0;
 
-        // user pointer storage
-        // init this as zero this still works on 32-on-64 LE
-        uint64_t u_pptr = 0;
-        uint64_t u_ptr = 0;
+		pr_info("sys_reboot: u_ptr: 0x%lx \n", (uintptr_t)u_ptr);
 
-        pr_info("sys_reboot: ppptr: 0x%lx \n", (uintptr_t)ppptr);
+		// for release
+		if (strncpy_from_user(release_buf, (char __user *)u_ptr, sizeof(release_buf)) < 0)
+			return 0;
+		release_buf[sizeof(release_buf) - 1] = '\0';
 
-        // arg here is ***, dereference to pull out **
-        if (copy_from_user(&u_pptr, (void __user *)*ppptr, sizeof(u_pptr)))
-            return 0;
+		// for version
+		if (strncpy_from_user(version_buf, (char __user *)(u_ptr + strlen(release_buf) + 1), sizeof(version_buf)) < 0)
+			return 0;
+		version_buf[sizeof(version_buf) - 1] = '\0';
 
-        pr_info("sys_reboot: u_pptr: 0x%lx \n", (uintptr_t)u_pptr);
+		if (original_release_buf[0] == '\0') {
+			struct new_utsname *u_curr = utsname();
+			// we save current version as the original before modifying
+			strncpy(original_release_buf, u_curr->release, sizeof(original_release_buf));
+			strncpy(original_version_buf, u_curr->version, sizeof(original_version_buf));
+			pr_info("sys_reboot: original uname saved: %s %s\n", original_release_buf, original_version_buf);
+		}
 
-        // now we got the __user **
-        // we cannot dereference this as this is __user
-        // we just do another copy_from_user to get it
-        if (copy_from_user(&u_ptr, (void __user *)u_pptr, sizeof(u_ptr)))
-            return 0;
+		// so user can reset
+		if (!strcmp(release_buf, "default")) {
+			memcpy(release_buf, original_release_buf, sizeof(release_buf));
+		}
 
-        pr_info("sys_reboot: u_ptr: 0x%lx \n", (uintptr_t)u_ptr);
+		if (!strcmp(version_buf, "default")) {
+			memcpy(version_buf, original_version_buf, sizeof(version_buf));
+		}
 
-        // for release
-        if (strncpy_from_user(release_buf, (char __user *)u_ptr, sizeof(release_buf)) < 0)
-            return 0;
-        release_buf[sizeof(release_buf) - 1] = '\0'; 
+		pr_info("sys_reboot: spoofing kernel to: %s - %s\n", release_buf, version_buf);
 
-        // for version
-        if (strncpy_from_user(version_buf, (char __user *)(u_ptr + strlen(release_buf) + 1), sizeof(version_buf)) < 0)
-            return 0;
-        version_buf[sizeof(version_buf) - 1] = '\0'; 
+		struct new_utsname *u = utsname();
 
-        if (original_release_buf[0] == '\0') {
-            struct new_utsname *u_curr = utsname();
-            // we save current version as the original before modifying
-            strncpy(original_release_buf, u_curr->release, sizeof(original_release_buf));
-            strncpy(original_version_buf, u_curr->version, sizeof(original_version_buf));
-            pr_info("sys_reboot: original uname saved: %s %s\n", original_release_buf, original_version_buf);
-        }
+		down_write(&uts_sem);
+		strncpy(u->release, release_buf, sizeof(u->release));
+		strncpy(u->version, version_buf, sizeof(u->version));
+		up_write(&uts_sem);
 
-        // so user can reset
-        if (!strcmp(release_buf, "default")) {
-             memcpy(release_buf, original_release_buf, sizeof(release_buf));
-        }
+		// we write our confirmation on **
+		if (copy_to_user((void __user *)*arg, &reply, sizeof(reply)))
+			return 0;
+	}
 
-        if (!strcmp(version_buf, "default")) {
-            memcpy(version_buf, original_version_buf, sizeof(version_buf));
-        }
+	if (magic2 == CHANGE_KSUFLAGS) {
+		// only root is allowed for this command
+		if (current_uid().val != 0)
+			return 0;
 
-        pr_info("sys_reboot: spoofing kernel to: %s - %s\n", release_buf, version_buf);
+		pr_info("sys_reboot: ksu_change_ksuflags to: %d\n", cmd);
+		ksuflags_override = cmd;
 
-        struct new_utsname *u = utsname();
+		if (copy_to_user((void __user *)*arg, &reply, sizeof(reply) ))
+			return 0;
+	}
 
-        down_write(&uts_sem);
-        strncpy(u->release, release_buf, sizeof(u->release));
-        strncpy(u->version, version_buf, sizeof(u->version));
-        up_write(&uts_sem);
-
-        // we write our confirmation on **
-        if (copy_to_user((void __user *)*arg, &reply, sizeof(reply)))
-            return 0;
-    }
-
-    if (magic2 == CHANGE_KSUFLAGS) {
-        // only root is allowed for this command
-        if (current_uid().val != 0)
-            return 0;
-
-        pr_info("sys_reboot: ksu_change_ksuflags to: %d\n", cmd);
-        ksuflags_override = cmd;
-
-        if (copy_to_user((void __user *)*arg, &reply, sizeof(reply) ))
-            return 0;
-    }
-
-    return 0;
+	return 0;
 }
 
 static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    struct pt_regs *real_regs = PT_REAL_REGS(regs);
-    int magic1 = (int)PT_REGS_PARM1(real_regs);
-    int magic2 = (int)PT_REGS_PARM2(real_regs);
-    int cmd = (int)PT_REGS_PARM3(real_regs);
-    void __user **arg = (void __user **)&PT_REGS_SYSCALL_PARM4(real_regs);
+	struct pt_regs *real_regs = PT_REAL_REGS(regs);
+	int magic1 = (int)PT_REGS_PARM1(real_regs);
+	int magic2 = (int)PT_REGS_PARM2(real_regs);
+	int cmd = (int)PT_REGS_PARM3(real_regs);
+	void __user **arg = (void __user **)&PT_REGS_SYSCALL_PARM4(real_regs);
 
-    return ksu_handle_sys_reboot(magic1, magic2, cmd, arg);
+	return ksu_handle_sys_reboot(magic1, magic2, cmd, arg);
 
 }
 
 static struct kprobe reboot_kp = {
-    .symbol_name = REBOOT_SYMBOL,
-    .pre_handler = reboot_handler_pre,
+	.symbol_name = REBOOT_SYMBOL,
+	.pre_handler = reboot_handler_pre,
 };
 
 void __init ksu_supercalls_init(void)
 {
-    int rc;
+	int rc;
 
-    ksu_supercall_dump_commands();
+	ksu_supercall_dump_commands();
 
-    tiny_sulog_init_heap(); // grab heap memory for sulog
+	tiny_sulog_init_heap(); // grab heap memory for sulog
 
-    rc = register_kprobe(&reboot_kp);
-    if (rc) {
-        pr_err("reboot kprobe failed: %d\n", rc);
-    } else {
-        pr_info("reboot kprobe registered successfully\n");
-    }
+	rc = register_kprobe(&reboot_kp);
+	if (rc) {
+		pr_err("reboot kprobe failed: %d\n", rc);
+	} else {
+		pr_info("reboot kprobe registered successfully\n");
+	}
 }
 
 void __exit ksu_supercalls_exit(void)
 {
-    if (sulog_buf_ptr) {
-        memzero_explicit(sulog_buf_ptr, SULOG_BUFSIZ);
-        kfree(sulog_buf_ptr);
-        sulog_buf_ptr = NULL;
-    }
+	if (sulog_buf_ptr) {
+		memzero_explicit(sulog_buf_ptr, SULOG_BUFSIZ);
+		kfree(sulog_buf_ptr);
+		sulog_buf_ptr = NULL;
+	}
 
-    unregister_kprobe(&reboot_kp);
-    ksu_supercall_cleanup_state();
+	unregister_kprobe(&reboot_kp);
+	ksu_supercall_cleanup_state();
 }
